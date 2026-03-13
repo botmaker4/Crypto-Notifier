@@ -61,38 +61,51 @@ def _verify_signature(raw_body: bytes, header_sig: str) -> bool:
 
 # ── Payload Normalisation ─────────────────────────────────────────────────────
 
+# Tatum sends full chain names in ADDRESS_EVENT payloads, not short codes.
+# Map them back to our internal ADDRESSES keys.
+TATUM_CHAIN_NAMES: dict[str, str] = {
+    "litecoin-mainnet":  "LTC",
+    "bsc-mainnet":       "BSC",
+    "polygon-mainnet":   "MATIC",
+    "solana-mainnet":    "SOL",
+    "ethereum-mainnet":  "ETH",
+    # Short codes as fallback (unlikely but safe)
+    "ltc":   "LTC",
+    "bsc":   "BSC",
+    "matic": "MATIC",
+    "sol":   "SOL",
+}
+
+
 def _normalise_payload(data: dict) -> Optional[dict]:
     """
     Normalise a Tatum ADDRESS_EVENT payload into a consistent internal dict.
 
-    Tatum ADDRESS_EVENT payload structure:
+    Real Tatum ADDRESS_EVENT payload:
     {
       "address": "the monitored address",
       "txId": "transaction hash",
-      "blockNumber": 12345,
-      "chain": "BSC",
-      "type": "incoming",        # "incoming" or "outgoing"
-      "amount": "0.5",
+      "blockNumber": 758703,
+      "chain": "litecoin-mainnet",   ← full chain name, NOT short code
+      "type": "native",              ← "native" or "token" (NOT incoming/outgoing)
+      "amount": "0.000231",
       "counterAddress": "sender address",
-      "asset": "BNB",            # or token contract address
-      "mempool": false,
-      "confirmations": 2,
-      "timestamp": 1710000000    # unix epoch (may be absent)
+      "asset": "LTC",
+      "subscriptionType": "ADDRESS_EVENT",
+      "confirmations": 2             ← may be absent on first detection
     }
 
     Returns None if the event should be skipped.
     """
-    # ── Chain ──
-    chain = (data.get("chain") or "").upper()
-    if not chain:
+    # ── Chain — map full Tatum name → our internal key ──
+    raw_chain = (data.get("chain") or "").lower()
+    if not raw_chain:
         log.debug("No chain in payload, ignoring: %s", data)
         return None
 
-    # ── Only process incoming transactions ──
-    tx_type = (data.get("type") or "incoming").lower()
-    if tx_type == "outgoing":
-        log.debug("Ignoring outgoing tx %s", data.get("txId"))
-        return None
+    # tx type is 'native' or 'token' — both are valid, we process all
+    tx_asset_type = (data.get("type") or "native").lower()
+    log.debug("Received %s tx on chain %s", tx_asset_type, raw_chain)
 
     # ── Address ──
     address = (data.get("address") or "").strip()
@@ -132,16 +145,21 @@ def _normalise_payload(data: dict) -> Optional[dict]:
     timestamp: Optional[str] = str(int(raw_ts)) if raw_ts else None
 
     # ── Match address to a monitored wallet ──
-    chain_key = chain  # fallback
-    matched = False
+    # Try matching by address first, then fall back to chain-name lookup
+    chain_key: Optional[str] = None
     for ck, addr in config.ADDRESSES.items():
         if addr.lower() == address.lower():
             chain_key = ck
-            matched = True
             break
 
-    if not matched:
-        log.debug("Address %s is not in monitored list, ignoring", address)
+    if chain_key is None:
+        # Try resolving chain key from the chain name
+        resolved = TATUM_CHAIN_NAMES.get(raw_chain)
+        if resolved and resolved in config.ADDRESSES:
+            chain_key = resolved
+
+    if chain_key is None:
+        log.debug("Address %s (chain=%s) is not in monitored list, ignoring", address, raw_chain)
         return None
 
     log.info(
