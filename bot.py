@@ -96,7 +96,7 @@ async def _get_usd_price(asset_symbol: str) -> Optional[float]:
         log.debug("No CoinGecko mapping for asset %s", symbol)
         return None
 
-    now = asyncio.get_event_loop().time()
+    now = asyncio.get_running_loop().time()
     if symbol in _price_cache:
         if now - _price_cache_ts.get(symbol, 0) < _PRICE_TTL:
             return _price_cache[symbol]
@@ -269,18 +269,26 @@ def _build_embed(record: TxRecord, event_type: str, usd_value: Optional[str]) ->
 
 async def _send_dm(embed: discord.Embed) -> bool:
     try:
+        log.info("Fetching Discord user %d to send DM...", config.DISCORD_USER_ID)
         user: Optional[discord.User] = await bot.fetch_user(config.DISCORD_USER_ID)
         if user is None:
             log.error("Could not find Discord user ID %d", config.DISCORD_USER_ID)
             return False
+        log.info("Opening DM channel with %s...", user)
         dm = await user.create_dm()
         await dm.send(embed=embed)
-        log.info("DM sent to user %d", config.DISCORD_USER_ID)
+        log.info("DM sent successfully to %s (ID: %d)", user, config.DISCORD_USER_ID)
         return True
     except discord.Forbidden:
-        log.error("Cannot send DM to user %d — DMs may be disabled.", config.DISCORD_USER_ID)
+        log.error(
+            "Cannot send DM to user %d — make sure the bot shares a server with that user "
+            "or has already received a message from them.",
+            config.DISCORD_USER_ID,
+        )
     except discord.HTTPException as e:
-        log.error("Discord HTTP error sending DM: %s", e)
+        log.error("Discord HTTP error sending DM (status=%s): %s", e.status, e)
+    except Exception as e:
+        log.exception("Unexpected error in _send_dm: %s", e)
     return False
 
 
@@ -289,24 +297,38 @@ async def _send_dm(embed: discord.Embed) -> bool:
 async def _process_event(record: TxRecord) -> None:
     from transaction_store import store
 
+    log.info(
+        "Processing event: txid=%s chain=%s asset=%s amount=%s confirmations=%d "
+        "notified_new=%s notified_confirmed=%s",
+        record.txid[:16], record.chain, record.asset, record.amount,
+        record.confirmations, record.notified_new, record.notified_confirmed,
+    )
+
     # Fetch USD value once for both potential embeds
     usd_value = await _compute_usd_value(record)
+    log.info("USD value computed: %s", usd_value or "N/A")
 
     # ── Event 1: First detection ──
     if not record.notified_new:
+        log.info("Sending 'new tx' DM for %s...", record.txid[:16])
         embed = _build_embed(record, "new", usd_value)
         success = await _send_dm(embed)
         if success:
             await store.mark_notified_new(record.txid)
             log.info("Notified (new tx): %s", record.txid)
+    else:
+        log.debug("Skipping 'new tx' DM — already notified for %s", record.txid[:16])
 
     # ── Event 2: ≥ 2 confirmations ──
     if record.confirmations >= 2 and not record.notified_confirmed:
+        log.info("Sending 'confirmed' DM for %s...", record.txid[:16])
         embed = _build_embed(record, "confirmed", usd_value)
         success = await _send_dm(embed)
         if success:
             await store.mark_notified_confirmed(record.txid)
             log.info("Notified (confirmed): %s", record.txid)
+    elif record.confirmations < 2:
+        log.debug("Not yet confirmed (%d/2): %s", record.confirmations, record.txid[:16])
 
 
 # ── Queue Consumer Task ───────────────────────────────────────────────────────
