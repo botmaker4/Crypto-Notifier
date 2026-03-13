@@ -1,0 +1,7 @@
+.env
+.env.example
+__pycache__/bot.cpython-312.pyc
+__pycache__/tatum_client.cpython-312.pyc
+__pycache__/webhook_server.cpython-312.pyc
+__pycache__/config.cpython-312.pyc
+__pycache__/transaction_store.cpython-312.pyc
