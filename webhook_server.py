@@ -119,12 +119,18 @@ def _normalise_payload(data: dict) -> Optional[dict]:
     # ── Amount ──
     amount = str(data.get("amount") or "0")
 
-    # ── USD value (not always present on free tier) ──
-    usd_value: Optional[str] = None
+    # ── Asset symbol: tells us which token was received (USDT, SOL, LTC, BNB, etc.) ──
+    # Tatum sends `asset` as a plain string ticker on ADDRESS_EVENT payloads
     raw_asset = data.get("asset")
-    if isinstance(raw_asset, dict):
-        usd_value = str(raw_asset.get("usdValue") or "")
-    elif data.get("usdValue"):
+    asset: str = ""
+    if isinstance(raw_asset, str) and raw_asset:
+        asset = raw_asset.upper()   # normalise e.g. "sol" → "SOL"
+    elif isinstance(raw_asset, dict):
+        asset = str(raw_asset.get("symbol") or raw_asset.get("name") or "").upper()
+
+    # ── USD value (rarely sent on free tier, we compute it in bot.py from the asset) ──
+    usd_value: Optional[str] = None
+    if data.get("usdValue"):
         usd_value = str(data["usdValue"])
 
     # ── Confirmations / block info ──
@@ -154,8 +160,8 @@ def _normalise_payload(data: dict) -> Optional[dict]:
         return None
 
     log.info(
-        "Incoming %s tx %s → %s  amount=%s  confirmations=%d",
-        chain_key, txid[:16], address[:12], amount, confirmations,
+        "Incoming %s tx %s → %s  asset=%s  amount=%s  confirmations=%d",
+        chain_key, txid[:16], address[:12], asset or "?", amount, confirmations,
     )
 
     return {
@@ -163,6 +169,7 @@ def _normalise_payload(data: dict) -> Optional[dict]:
         "chain": chain_key,
         "address": address,
         "amount": amount,
+        "asset": asset,
         "usd_value": usd_value or None,
         "block_height": block_height,
         "timestamp": timestamp,

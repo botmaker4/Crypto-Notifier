@@ -9,12 +9,15 @@ Architecture:
 """
 
 import asyncio
+import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
 import discord
-from discord.ext import commands, tasks
+import httpx
+from discord.ext import commands
 import uvicorn
 
 import config
@@ -29,78 +32,153 @@ log = logging.getLogger("crypto-notifier.bot")
 # ── Shared event queue ────────────────────────────────────────────────────────
 event_queue: asyncio.Queue = asyncio.Queue()
 
-# ── Discord bot setup ──────────────────────────────────────────────────────────
+# ── Discord bot setup ─────────────────────────────────────────────────────────
 intents = discord.Intents.default()
-intents.message_content = False  # Not needed for DM-only bot
+intents.message_content = False
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents,
-    help_command=None,
-)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# ── Embed colours ──────────────────────────────────────────────────────────────
-COLOR_PENDING   = 0xF4C542   # Gold/Yellow
-COLOR_CONFIRMED = 0x2ECC71   # Green
-COLOR_ERROR     = 0xE74C3C   # Red
+# ── Embed colours ─────────────────────────────────────────────────────────────
+COLOR_PENDING   = 0xF4C430   # Vivid gold
+COLOR_CONFIRMED = 0x2ECC71   # Emerald green
 
-# ── Chain emoji map ───────────────────────────────────────────────────────────
-CHAIN_EMOJI: dict[str, str] = {
-    "LTC":   "🪙",
-    "BSC":   "🔶",
-    "MATIC": "🟣",
-    "SOL":   "◎",
-    "BNB":   "🟡",
+# ── Emoji loader ──────────────────────────────────────────────────────────────
+_EMOJI_PATH = os.path.join(os.path.dirname(__file__), "emojis.json")
+
+def _load_emojis() -> dict[str, str]:
+    try:
+        with open(_EMOJI_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning("Could not load emojis.json: %s — using defaults", e)
+        return {}
+
+EMOJIS: dict[str, str] = _load_emojis()
+
+def E(key: str, fallback: str = "") -> str:
+    """Get an emoji by key from emojis.json."""
+    return EMOJIS.get(key, fallback)
+
+
+# ── CoinGecko USD price fetcher ───────────────────────────────────────────────
+# Maps asset symbol (from Tatum payload) to CoinGecko coin ID.
+# Stablecoins (USDT, USDC) map to None meaning $1.00 per unit.
+COINGECKO_IDS: dict[str, Optional[str]] = {
+    "LTC":   "litecoin",
+    "SOL":   "solana",
+    "BNB":   "binancecoin",
+    "MATIC": "matic-network",
+    "USDT":  None,   # stablecoin, always $1
+    "USDC":  None,
+    "BUSD":  None,
 }
 
-
-# ── Embed Builders ────────────────────────────────────────────────────────────
-
-def _short_txid(txid: str, length: int = 16) -> str:
-    """Shorten a transaction hash for display."""
-    if len(txid) <= length * 2 + 3:
-        return txid
-    return f"{txid[:length]}...{txid[-8:]}"
+# Simple price cache to avoid hammering CoinGecko on every tx
+_price_cache: dict[str, float] = {}
+_price_cache_ts: dict[str, float] = {}
+_PRICE_TTL = 120  # seconds
 
 
-def _explorer_link(record: TxRecord) -> str:
-    base = tatum_client.EXPLORER_URLS.get(record.chain, "")
-    if base:
-        return f"[View on Explorer]({base}{record.txid})"
-    return "N/A"
-
-
-def _format_amount(record: TxRecord) -> str:
-    """Format amount with chain ticker."""
-    tickers = {
-        "LTC":   "LTC",
-        "BSC":   "USDT",
-        "MATIC": "USDT",
-        "SOL":   "SOL",
-        "BNB":   "BNB",
-    }
-    ticker = tickers.get(record.chain, "")
-    return f"`{record.amount} {ticker}`"
-
-
-def _build_embed(record: TxRecord, event_type: str) -> discord.Embed:
+async def _get_usd_price(asset_symbol: str) -> Optional[float]:
     """
-    Build a rich Discord embed for a transaction event.
+    Fetch the current USD price for a given asset symbol.
+    Stablecoins (USDT, USDC, BUSD) return 1.0 immediately.
+    Uses a 2-minute in-memory cache per asset.
+    """
+    symbol = asset_symbol.upper()
 
+    # Stablecoin shortcut
+    if COINGECKO_IDS.get(symbol) is None and symbol in COINGECKO_IDS:
+        return 1.0
+
+    coin_id = COINGECKO_IDS.get(symbol)
+    if not coin_id:
+        log.debug("No CoinGecko mapping for asset %s", symbol)
+        return None
+
+    now = asyncio.get_event_loop().time()
+    if symbol in _price_cache:
+        if now - _price_cache_ts.get(symbol, 0) < _PRICE_TTL:
+            return _price_cache[symbol]
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": coin_id, "vs_currencies": "usd"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            price: float = data[coin_id]["usd"]
+            _price_cache[symbol] = price
+            _price_cache_ts[symbol] = now
+            log.debug("CoinGecko price for %s: $%.4f", symbol, price)
+            return price
+    except Exception as e:
+        log.warning("Could not fetch USD price for %s: %s", symbol, e)
+        return None
+
+
+async def _compute_usd_value(record: TxRecord) -> Optional[str]:
+    """Return formatted USD value string, or None if unavailable."""
+    # If Tatum already gave us a USD value, use it
+    if record.usd_value:
+        try:
+            return f"${float(record.usd_value):,.2f}"
+        except ValueError:
+            pass
+
+    # Determine the asset symbol to price:
+    # prefer record.asset (e.g. 'SOL' on BSC), fallback to chain-default ticker
+    asset_symbol = (
+        record.asset
+        or tatum_client.CHAIN_TICKERS.get(record.chain, "")
+    ).upper()
+
+    try:
+        price = await _get_usd_price(asset_symbol)
+        amount = float(record.amount)
+        if price is not None:
+            return f"${price * amount:,.2f}"
+    except Exception as e:
+        log.debug("USD calc failed: %s", e)
+
+    return None
+
+
+# ── Embed Builder ─────────────────────────────────────────────────────────────
+
+def _short_hash(h: str, head: int = 10, tail: int = 8) -> str:
+    if len(h) <= head + tail + 3:
+        return h
+    return f"{h[:head]}...{h[-tail:]}"
+
+
+def _build_embed(record: TxRecord, event_type: str, usd_value: Optional[str]) -> discord.Embed:
+    """
+    Build a rich, cleanly formatted Discord embed.
     event_type: "new" | "confirmed"
     """
-    is_confirmed = event_type == "confirmed"
-    chain_label  = tatum_client.CHAIN_LABELS.get(record.chain, record.chain)
-    emoji        = CHAIN_EMOJI.get(record.chain, "💰")
+    is_confirmed  = event_type == "confirmed"
+    chain_label   = tatum_client.CHAIN_LABELS.get(record.chain, record.chain)
+    # Use asset symbol from payload (e.g. 'SOL' on BSC) as the displayed ticker
+    ticker = (
+        record.asset
+        or tatum_client.CHAIN_TICKERS.get(record.chain, "")
+    )
+    chain_emoji   = E(record.chain.lower(), E("fallback", "💎"))
+    explorer_base = tatum_client.EXPLORER_URLS.get(record.chain, "")
 
     if is_confirmed:
-        title  = f"{emoji} Transaction Confirmed"
-        colour = COLOR_CONFIRMED
-        status = "✅ Confirmed"
+        title       = f"{chain_emoji}  Transaction Confirmed"
+        colour      = COLOR_CONFIRMED
+        status_val  = f"{E('confirmed', '✅')}  Confirmed"
+        footer_text = f"Transaction Confirmed  •  Made by xavierlol"
     else:
-        title  = f"{emoji} New Transaction Detected"
-        colour = COLOR_PENDING
-        status = "⏳ Pending"
+        title       = f"{chain_emoji}  New Transaction Detected"
+        colour      = COLOR_PENDING
+        status_val  = f"{E('pending', '⏳')}  Pending"
+        footer_text = f"Transaction Detected  •  Made by xavierlol"
 
     embed = discord.Embed(
         title=title,
@@ -108,53 +186,88 @@ def _build_embed(record: TxRecord, event_type: str) -> discord.Embed:
         timestamp=datetime.now(timezone.utc),
     )
 
-    # ── Transaction Info ──
-    embed.add_field(name="🌐 Network",    value=chain_label,               inline=True)
-    embed.add_field(name="📊 Status",     value=status,                    inline=True)
-    embed.add_field(name="✅ Confirmations", value=f"`{record.confirmations}`", inline=True)
-
-    embed.add_field(name="💵 Amount",     value=_format_amount(record),    inline=True)
-    usd = f"`${record.usd_value}`" if record.usd_value else "`N/A`"
-    embed.add_field(name="💲 USD Value",  value=usd,                       inline=True)
-    embed.add_field(name="\u200b",        value="\u200b",                  inline=True)  # spacer
-
-    # ── Address & TXID ──
+    # ── Row 1: Network | Status | Confirmations ──
     embed.add_field(
-        name="📬 Receiving Address",
-        value=f"`{record.address}`",
-        inline=False,
+        name=f"{E('network', '🌐')}  Network",
+        value=f"**{chain_label}**",
+        inline=True,
     )
     embed.add_field(
-        name="🔗 Transaction Hash",
-        value=f"`{record.txid}`",
+        name=f"{E('status', '📊')}  Status",
+        value=status_val,
+        inline=True,
+    )
+    embed.add_field(
+        name=f"{E('confirmations', '✅')}  Confirmations",
+        value=f"**{record.confirmations}**",
+        inline=True,
+    )
+
+    # ── Row 2: Amount | USD Value | blank ──
+    amount_str = f"**{record.amount} {ticker}**" if ticker else f"**{record.amount}**"
+    usd_str    = f"**{usd_value}**" if usd_value else "*Unavailable*"
+
+    embed.add_field(
+        name=f"{E('amount', '💰')}  Amount",
+        value=amount_str,
+        inline=True,
+    )
+    embed.add_field(
+        name=f"{E('usd', '💲')}  USD Value",
+        value=usd_str,
+        inline=True,
+    )
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
+
+    # ── Row 3: Receiving Address (full width) ──
+    embed.add_field(
+        name=f"{E('address', '📬')}  Receiving Address",
+        value=f"```{record.address}```",
         inline=False,
     )
 
-    # ── Block Details ──
-    block_val = f"`{record.block_height}`" if record.block_height else "`N/A`"
-    embed.add_field(name="📦 Block Height", value=block_val, inline=True)
+    # ── Row 4: Transaction Hash (full width) ──
+    embed.add_field(
+        name=f"{E('txid', '🔗')}  Transaction Hash",
+        value=f"```{record.txid}```",
+        inline=False,
+    )
 
-    ts_val = f"<t:{record.timestamp}:F>" if record.timestamp and record.timestamp.isdigit() else (record.timestamp or "N/A")
-    embed.add_field(name="🕒 Timestamp",    value=ts_val,                  inline=True)
-    embed.add_field(name="\u200b",          value="\u200b",                inline=True)  # spacer
+    # ── Row 5: Block Height | Timestamp ──
+    block_val = f"**{record.block_height}**" if record.block_height else "*Unknown*"
 
-    # ── Explorer link ──
-    base_url = tatum_client.EXPLORER_URLS.get(record.chain, "")
-    if base_url:
+    if record.timestamp and record.timestamp.isdigit():
+        ts_val = f"<t:{record.timestamp}:F>"
+    else:
+        ts_val = record.timestamp or "*Unknown*"
+
+    embed.add_field(
+        name=f"{E('block', '📦')}  Block Height",
+        value=block_val,
+        inline=True,
+    )
+    embed.add_field(
+        name=f"{E('time', '🕒')}  Time",
+        value=ts_val,
+        inline=True,
+    )
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
+
+    # ── Row 6: Explorer link ──
+    if explorer_base:
         embed.add_field(
-            name="🔍 Blockchain Explorer",
-            value=f"[View Transaction ↗]({base_url}{record.txid})",
+            name=f"{E('explorer', '🔍')}  Blockchain Explorer",
+            value=f"[{E('explorer', '🔍')} View Transaction ↗]({explorer_base}{record.txid})",
             inline=False,
         )
 
-    embed.set_footer(text="Crypto Notifier  •  Powered by Tatum")
+    embed.set_footer(text=footer_text)
     return embed
 
 
 # ── DM Sender ─────────────────────────────────────────────────────────────────
 
 async def _send_dm(embed: discord.Embed) -> bool:
-    """Fetch the configured user and send them a DM."""
     try:
         user: Optional[discord.User] = await bot.fetch_user(config.DISCORD_USER_ID)
         if user is None:
@@ -165,7 +278,7 @@ async def _send_dm(embed: discord.Embed) -> bool:
         log.info("DM sent to user %d", config.DISCORD_USER_ID)
         return True
     except discord.Forbidden:
-        log.error("Cannot send DM to user %d — they may have DMs disabled.", config.DISCORD_USER_ID)
+        log.error("Cannot send DM to user %d — DMs may be disabled.", config.DISCORD_USER_ID)
     except discord.HTTPException as e:
         log.error("Discord HTTP error sending DM: %s", e)
     return False
@@ -174,18 +287,14 @@ async def _send_dm(embed: discord.Embed) -> bool:
 # ── Notification Logic ────────────────────────────────────────────────────────
 
 async def _process_event(record: TxRecord) -> None:
-    """
-    Decides which (if any) DM to send based on the record's state.
-
-    Rules:
-      - Event 1: new tx  →  notified_new == False → send "new tx" DM
-      - Event 2: ≥2 confs → notified_confirmed == False → send "confirmed" DM
-    """
     from transaction_store import store
+
+    # Fetch USD value once for both potential embeds
+    usd_value = await _compute_usd_value(record)
 
     # ── Event 1: First detection ──
     if not record.notified_new:
-        embed = _build_embed(record, "new")
+        embed = _build_embed(record, "new", usd_value)
         success = await _send_dm(embed)
         if success:
             await store.mark_notified_new(record.txid)
@@ -193,7 +302,7 @@ async def _process_event(record: TxRecord) -> None:
 
     # ── Event 2: ≥ 2 confirmations ──
     if record.confirmations >= 2 and not record.notified_confirmed:
-        embed = _build_embed(record, "confirmed")
+        embed = _build_embed(record, "confirmed", usd_value)
         success = await _send_dm(embed)
         if success:
             await store.mark_notified_confirmed(record.txid)
@@ -203,7 +312,6 @@ async def _process_event(record: TxRecord) -> None:
 # ── Queue Consumer Task ───────────────────────────────────────────────────────
 
 async def _queue_consumer() -> None:
-    """Background coroutine — drains event_queue and processes each tx event."""
     log.info("Event queue consumer started.")
     while True:
         try:
@@ -211,7 +319,7 @@ async def _queue_consumer() -> None:
             await _process_event(record)
             event_queue.task_done()
         except asyncio.TimeoutError:
-            continue  # No events — keep looping
+            continue
         except Exception as e:
             log.exception("Error processing event from queue: %s", e)
 
@@ -234,13 +342,12 @@ async def on_error(event: str, *args, **kwargs) -> None:
 # ── Uvicorn Server ────────────────────────────────────────────────────────────
 
 async def _run_webhook_server() -> None:
-    """Run the FastAPI/uvicorn server in the same event loop as discord.py."""
     server_config = uvicorn.Config(
         app=webhook_server.app,
         host="0.0.0.0",
         port=config.WEBHOOK_PORT,
-        log_level="warning",  # uvicorn access logs suppressed; our logger handles it
-        loop="none",          # Use the existing event loop
+        log_level="warning",
+        loop="none",
     )
     server = uvicorn.Server(server_config)
     log.info("Webhook server starting on port %d", config.WEBHOOK_PORT)
@@ -250,9 +357,7 @@ async def _run_webhook_server() -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    # Inject the shared queue into the webhook server
     webhook_server.set_event_queue(event_queue)
-
     async with bot:
         await asyncio.gather(
             bot.start(config.DISCORD_TOKEN),

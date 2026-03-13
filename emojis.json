@@ -1,0 +1,20 @@
+{
+  "ltc":          "🪙",
+  "bsc":          "🔶",
+  "matic":        "🟣",
+  "sol":          "◎",
+  "network":      "🌐",
+  "status":       "📊",
+  "confirmations":"✅",
+  "amount":       "💰",
+  "usd":          "💲",
+  "address":      "📬",
+  "txid":         "🔗",
+  "block":        "📦",
+  "time":         "🕒",
+  "explorer":     "🔍",
+  "pending":      "⏳",
+  "confirmed":    "✅",
+  "new_tx":       "🔔",
+  "fallback":     "💎"
+}

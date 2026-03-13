@@ -25,16 +25,22 @@ CHAIN_MAP: dict[str, str] = {
     "BSC":   "BSC",
     "MATIC": "MATIC",
     "SOL":   "SOL",
-    "BNB":   "BSC",   # BNB/BEP-20 also uses the BSC chain in Tatum
 }
 
 # Human-readable labels for Discord embeds
 CHAIN_LABELS: dict[str, str] = {
-    "LTC":   "Litecoin (LTC)",
-    "BSC":   "BNB Smart Chain (BSC)",
-    "MATIC": "Polygon (MATIC / POL)",
-    "SOL":   "Solana (SOL)",
-    "BNB":   "BNB Smart Chain (BNB)",
+    "LTC":   "Litecoin",
+    "BSC":   "BNB Smart Chain",
+    "MATIC": "Polygon",
+    "SOL":   "Solana",
+}
+
+# Tickers shown next to amounts in embeds
+CHAIN_TICKERS: dict[str, str] = {
+    "LTC":   "LTC",
+    "BSC":   "USDT",
+    "MATIC": "USDT",
+    "SOL":   "SOL",
 }
 
 # Blockchain explorer base URLs for transaction links
@@ -43,7 +49,6 @@ EXPLORER_URLS: dict[str, str] = {
     "BSC":   "https://bscscan.com/tx/",
     "MATIC": "https://polygonscan.com/tx/",
     "SOL":   "https://solscan.io/tx/",
-    "BNB":   "https://bscscan.com/tx/",
 }
 
 

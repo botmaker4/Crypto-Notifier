@@ -23,6 +23,7 @@ class TxRecord:
     usd_value: Optional[str]
     block_height: Optional[int]
     timestamp: Optional[str]
+    asset: str = ""            # token/coin symbol from Tatum payload (e.g. 'USDT', 'SOL', 'LTC')
     confirmations: int = 0
 
     # Notification flags — prevent duplicate DMs
@@ -60,10 +61,11 @@ class TransactionStore:
                     usd_value=data.get("usd_value"),
                     block_height=data.get("block_height"),
                     timestamp=data.get("timestamp"),
+                    asset=data.get("asset", ""),
                     confirmations=data.get("confirmations", 0),
                 )
                 self._store[txid] = record
-                log.info("New tx stored: %s on %s", txid, data["chain"])
+                log.info("New tx stored: %s on %s (asset=%s)", txid, data["chain"], data.get("asset", "?"))
             return record
 
     async def get(self, txid: str) -> Optional[TxRecord]:
