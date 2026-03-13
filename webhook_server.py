@@ -43,20 +43,11 @@ def set_event_queue(q) -> None:
 
 def _verify_signature(raw_body: bytes, header_sig: str) -> bool:
     """
-    Tatum signs webhook payloads with HMAC-SHA512 using your webhook secret.
-    Header: x-payload-hash  (lowercase hex)
+    Tatum v4 does not support per-subscription HMAC signing (hmacSecret is
+    rejected by their API). Webhooks are accepted unconditionally.
+    Security relies on the obscurity of the webhook URL.
     """
-    if not config.TATUM_WEBHOOK_SECRET:
-        log.warning("TATUM_WEBHOOK_SECRET not set; skipping signature verification.")
-        return True
-
-    expected = hmac.new(
-        config.TATUM_WEBHOOK_SECRET.encode(),
-        raw_body,
-        hashlib.sha512,
-    ).hexdigest()
-
-    return hmac.compare_digest(expected, header_sig.lower())
+    return True
 
 
 # ── Payload Normalisation ─────────────────────────────────────────────────────

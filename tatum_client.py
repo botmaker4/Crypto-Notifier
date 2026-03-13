@@ -72,8 +72,6 @@ async def create_subscription(chain_key: str, address: str, webhook_url: str) ->
             "address": address,
             "chain": tatum_chain,
             "url": webhook_url,
-            # Only include hmacSecret if configured — Tatum will sign webhooks with it
-            **({"hmacSecret": config.TATUM_WEBHOOK_SECRET} if config.TATUM_WEBHOOK_SECRET else {}),
         },
     }
 
