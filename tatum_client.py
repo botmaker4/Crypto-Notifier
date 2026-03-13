@@ -2,7 +2,7 @@
 tatum_client.py — Async Tatum v4 REST API client.
 
 Handles:
-  - Creating ADDRESS_TRANSACTION webhook subscriptions
+  - Creating ADDRESS_EVENT webhook subscriptions (valid Tatum v4 type)
   - Listing existing subscriptions (to avoid duplicates on restart)
   - Deleting subscriptions
   - Auto-setup for all configured addresses at bot startup
@@ -56,7 +56,9 @@ def _headers() -> dict[str, str]:
 
 async def create_subscription(chain_key: str, address: str, webhook_url: str) -> Optional[dict]:
     """
-    Register a Tatum ADDRESS_TRANSACTION subscription.
+    Register a Tatum ADDRESS_EVENT subscription.
+    ADDRESS_EVENT is the correct v4 type for monitoring all transactions
+    (incoming/outgoing native + fungible) on a given address.
     Returns the created subscription dict, or None on failure.
     """
     tatum_chain = CHAIN_MAP.get(chain_key.upper())
@@ -65,7 +67,7 @@ async def create_subscription(chain_key: str, address: str, webhook_url: str) ->
         return None
 
     payload = {
-        "type": "ADDRESS_TRANSACTION",
+        "type": "ADDRESS_EVENT",
         "attr": {
             "address": address,
             "chain": tatum_chain,
