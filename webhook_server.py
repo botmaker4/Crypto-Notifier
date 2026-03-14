@@ -68,35 +68,67 @@ TATUM_CHAIN_NAMES: dict[str, str] = {
 }
 
 
+# ── Known ERC-20 / BEP-20 contract addresses → token symbol ──────────────────
+# Tatum sometimes sends the contract address as `asset` instead of the symbol.
+# We map known ones to their proper symbol so USD pricing works correctly.
+KNOWN_CONTRACTS: dict[str, str] = {
+    # USDT
+    "0x55d398326f99059ff775485246999027b3197955": "USDT",  # BSC
+    "0xc2132d05d31c914a87c6611c10748aeb04b58e8f": "USDT",  # Polygon
+    "0xdac17f958d2ee523a2206206994597c13d831ec7": "USDT",  # Ethereum
+    # USDC
+    "0x2791bca1f2de4661ed88a30c99a7a9449aa84174": "USDC",  # Polygon
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d": "USDC",  # BSC
+    # Wrapped SOL on BSC
+    "0x570a5d26f7765ecb712c0924e4de545b89fd43df": "SOL",
+    # WBTC
+    "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599": "WBTC",
+    "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6": "WBTC",  # Polygon
+    # WETH
+    "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619": "WETH",  # Polygon
+    "0x2170ed0880ac9a755fd29b2688956bd959f933f8": "WETH",  # BSC
+}
+
+# Maximum age of a transaction we'll notify about (prevents re-notification on restart)
+MAX_TX_AGE_SECONDS: int = 2 * 60 * 60   # 2 hours
+
+
+def _resolve_asset(raw_asset) -> str:
+    """
+    Convert Tatum's `asset` field to a clean token symbol.
+    Handles both plain symbols ('USDT') and contract addresses ('0xc213...').
+    """
+    if not raw_asset:
+        return ""
+    if isinstance(raw_asset, dict):
+        raw_asset = raw_asset.get("symbol") or raw_asset.get("name") or ""
+    s = str(raw_asset).strip()
+    # If it looks like a contract address, try to resolve it
+    if s.startswith("0x") or s.startswith("0X"):
+        resolved = KNOWN_CONTRACTS.get(s.lower())
+        if resolved:
+            return resolved
+        # Unknown contract — return empty so bot falls back to chain default ticker
+        log.debug("Unknown contract address as asset: %s", s)
+        return ""
+    return s.upper()
+
+
 def _normalise_payload(data: dict) -> Optional[dict]:
     """
     Normalise a Tatum ADDRESS_EVENT payload into a consistent internal dict.
-
-    Real Tatum ADDRESS_EVENT payload:
-    {
-      "address": "the monitored address",
-      "txId": "transaction hash",
-      "blockNumber": 758703,
-      "chain": "litecoin-mainnet",   ← full chain name, NOT short code
-      "type": "native",              ← "native" or "token" (NOT incoming/outgoing)
-      "amount": "0.000231",
-      "counterAddress": "sender address",
-      "asset": "LTC",
-      "subscriptionType": "ADDRESS_EVENT",
-      "confirmations": 2             ← may be absent on first detection
-    }
-
     Returns None if the event should be skipped.
     """
+    import time as _time
+
     # ── Chain — map full Tatum name → our internal key ──
     raw_chain = (data.get("chain") or "").lower()
     if not raw_chain:
         log.debug("No chain in payload, ignoring: %s", data)
         return None
 
-    # tx type is 'native' or 'token' — both are valid, we process all
-    tx_asset_type = (data.get("type") or "native").lower()
-    log.debug("Received %s tx on chain %s", tx_asset_type, raw_chain)
+    # tx type: 'native' or 'token' — process both
+    log.debug("Received %s tx on chain %s", data.get("type", "?"), raw_chain)
 
     # ── Address ──
     address = (data.get("address") or "").strip()
@@ -119,30 +151,42 @@ def _normalise_payload(data: dict) -> Optional[dict]:
     # ── Amount ──
     amount = str(data.get("amount") or "0")
 
-    # ── Asset symbol: tells us which token was received (USDT, SOL, LTC, BNB, etc.) ──
-    # Tatum sends `asset` as a plain string ticker on ADDRESS_EVENT payloads
-    raw_asset = data.get("asset")
-    asset: str = ""
-    if isinstance(raw_asset, str) and raw_asset:
-        asset = raw_asset.upper()   # normalise e.g. "sol" → "SOL"
-    elif isinstance(raw_asset, dict):
-        asset = str(raw_asset.get("symbol") or raw_asset.get("name") or "").upper()
+    # ── Asset symbol — resolve contract addresses to proper tickers ──
+    asset: str = _resolve_asset(data.get("asset"))
 
-    # ── USD value (rarely sent on free tier, we compute it in bot.py from the asset) ──
+    # ── USD value (rarely sent on free tier) ──
     usd_value: Optional[str] = None
     if data.get("usdValue"):
         usd_value = str(data["usdValue"])
 
-    # ── Confirmations / block info ──
-    confirmations: int = int(data.get("confirmations") or 0)
+    # ── Confirmations — Tatum uses both field names ──
+    confirmations: int = int(
+        data.get("confirmations")
+        or data.get("blockConfirmations")
+        or 0
+    )
+
+    # ── Block info ──
     block_height: Optional[int] = data.get("blockNumber") or data.get("blockHeight")
 
-    # Tatum sends timestamp as unix int — convert to string for display
+    # ── Timestamp — reject stale transactions to prevent re-alerts on restart ──
     raw_ts = data.get("timestamp") or data.get("blockTimestamp")
-    timestamp: Optional[str] = str(int(raw_ts)) if raw_ts else None
+    timestamp: Optional[str] = None
+    if raw_ts:
+        try:
+            ts_int = int(raw_ts)
+            age = _time.time() - ts_int
+            if age > MAX_TX_AGE_SECONDS:
+                log.info(
+                    "Ignoring stale tx %s (%.1f hours old) — skipping to avoid re-notification.",
+                    txid[:16], age / 3600,
+                )
+                return None
+            timestamp = str(ts_int)
+        except (ValueError, TypeError):
+            pass
 
     # ── Match address to a monitored wallet ──
-    # Try matching by address first, then fall back to chain-name lookup
     chain_key: Optional[str] = None
     for ck, addr in config.ADDRESSES.items():
         if addr.lower() == address.lower():
@@ -150,18 +194,17 @@ def _normalise_payload(data: dict) -> Optional[dict]:
             break
 
     if chain_key is None:
-        # Try resolving chain key from the chain name
         resolved = TATUM_CHAIN_NAMES.get(raw_chain)
         if resolved and resolved in config.ADDRESSES:
             chain_key = resolved
 
     if chain_key is None:
-        log.debug("Address %s (chain=%s) is not in monitored list, ignoring", address, raw_chain)
+        log.debug("Address %s (chain=%s) not in monitored list, ignoring", address, raw_chain)
         return None
 
     log.info(
-        "Incoming %s tx %s → %s  asset=%s  amount=%s  confirmations=%d",
-        chain_key, txid[:16], address[:12], asset or "?", amount, confirmations,
+        "Incoming %s tx %s  asset=%s  amount=%s  confirmations=%d",
+        chain_key, txid[:16], asset or "?", amount, confirmations,
     )
 
     return {
